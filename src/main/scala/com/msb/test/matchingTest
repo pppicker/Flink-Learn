@@ -1,0 +1,211 @@
+package comjson
+
+import com.alibaba.fastjson.JSON
+import org.apache.flink.api.common.serialization.SimpleStringSchema
+import Utils.{JedisUtils_pro, PropertiesUtils}
+import org.apache.flink.api.common.functions.{RichMapFunction, RichMapPartitionFunction}
+import org.apache.flink.api.scala._
+import org.apache.flink.configuration.Configuration
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
+import org.apache.flink.streaming.connectors.kafka.{FlinkKafkaConsumer, FlinkKafkaProducer}
+import org.apache.flink.util.Collector
+import redis.clients.jedis.JedisCluster
+import wb.{FileReport, PgMap, RegexEstimate}
+import wbdomainquery.FileReportDomain
+
+import java.text.SimpleDateFormat
+import java.{lang, util}
+import java.util.{Date, Properties}
+
+
+/*
+通过kafka获取DNS json格式数据,与微步威胁情报库进行匹配，
+发送到安全治理平台的kafka中
+bigdata-dns-topic-matching-expand -> threat-device
+ */
+
+object DnsMatching {
+
+  def main(args: Array[String]): Unit = {
+
+    val bootstrap_servers = PropertiesUtils.getProp("kafka.bootstrap.servers")
+    val bootstrap_servers_YYM = PropertiesUtils.getProp("kafka.bootstrap.servers.YYM")
+    val consumer_topic = PropertiesUtils.getProp("kafka.dnsMacthing.topic")
+    val producer_topic = PropertiesUtils.getProp("kafka.YYM.dns.topic")
+
+    var dnsMatching = new util.HashMap[String,String]()
+    var count = 0
+    //刷新DNS微步接接口近7日数据库缓存
+    PgMap.wb_get_pg_to_map()
+    //获取DNS微步接接口近7日数据库缓存
+    dnsMatching = PgMap.domainsMatchingTest
+
+    val hash_key = "dns:wb:hash"
+    val jedisCluster = JedisUtils_pro.createMyJedis()
+    //初始化redis hash_key
+    jedisCluster.del(hash_key)
+    jedisCluster.hmset(hash_key,dnsMatching)
+
+    /*
+     * @Description 重新获取DNS微步近7日缓存数据和DNS今日访问微步接口次数
+     * @Date 9:41 2022/6/16
+     * @Param []
+     * @return []
+     **/
+    def clear(jedisCluster: JedisCluster) : Unit = {
+      PgMap.wb_get_pg_to_map()
+      dnsMatching = PgMap.domainsMatchingTest
+      //将微步缓存数据存入redis hash
+      jedisCluster.del(hash_key)
+      jedisCluster.hmset(hash_key,dnsMatching)
+      count = PgMap.wb_get_pg_to_count()/8
+    }
+
+//    def printRedisHash(jedisCluster: JedisCluster) : Unit = {
+//      jedisCluster.hget
+//    }
+
+
+    val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(8)
+    env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime)
+
+    val properties = new Properties()
+    properties.setProperty("bootstrap.servers", bootstrap_servers)
+
+    if(args(0).equals("stable")) {
+      val ss1 = new SimpleDateFormat("yyyy-MM-dd-HH-mm").format(new Date())
+      properties.setProperty("group.id", s"DnsMatching_${ss1}")
+    } else {
+      properties.setProperty("group.id", args(0))
+    }
+
+
+    val kafkaSource = new FlinkKafkaConsumer[String](consumer_topic, new SimpleStringSchema(), properties)
+    val tesDS: DataStream[String] = env.addSource(kafkaSource)
+
+    val mapResult = tesDS.map(
+      new RichMapFunction[String,String] {
+        var jedisCluster: JedisCluster = null
+
+        override def open(configuration: Configuration): Unit = {
+          jedisCluster = JedisUtils_pro.createMyJedis()
+        }
+
+        override def map(in: String): String = {
+          val t = new SimpleDateFormat("HH:mm:ss").format(new Date())
+          //      凌晨2点清空旧缓存，重新获取微步新缓存，并重置count计数开始访问微步接口
+          if(t.equals("02:01:00")){
+            println("################################",t)
+            clear(jedisCluster)
+            print("2点零1分00秒打印统计信息：" + PgMap.wb_get_pg_to_count())
+          }
+          val srcip = JSON.parseObject(in).getString("srcip")
+          var level = "low"
+          if (level.equals("medium")) {
+            level = "middle"
+          }
+
+          var tags = "tags"
+          val data_update_time = JSON.parseObject(in).getString("dns_data_time")
+          var ruleId = ""
+          val ipaddr = JSON.parseObject(in).getString("ipaddr")
+          var rulePrimaryKey = ""
+          val dns_data_time = JSON.parseObject(in).getString("dns_data_time")
+          val qname = JSON.parseObject(in).getString("qname")
+          //println("qname===",qname)
+
+          var wb_api_data = "0@0@0"
+
+          //判断集合里是否存在qname,如果不存在，则访问微步接口，并将获取信息set进redis hash_key
+          if (jedisCluster.hexists(hash_key,qname)) {
+//            println("redis缓存匹配到qname: " + qname)
+            wb_api_data = jedisCluster.hget(hash_key, qname)
+          }
+          else {
+//            println("redis缓存没有匹配到qname: " + qname)
+            if (count < 1125) {
+              //Thread.sleep(10)
+              if (RegexEstimate.isLetterDigitOrChinese(qname)) {
+                //失陷检测  /scene/dns   查询微步接口并插入pg数据库network_security.wb_level_tags
+                wb_api_data = FileReport.sendRequest(qname)
+                //redis中设置 hash  (qname,wb_api_data)
+                jedisCluster.hset(hash_key,qname,wb_api_data)
+                //            dnsMatching += (wb_api_data.split("@")(0) -> wb_api_data)
+                count = count + 1
+              }
+
+            }
+          }
+          level = wb_api_data.split("@")(1)
+          tags = wb_api_data.split("@")(2)
+
+          if (level.equals("high") || level.equals("critical")) {
+            ruleId = "553159140042743808"
+            rulePrimaryKey = "1"
+          }
+          if (level.equals("medium") || level.equals("middle")) {
+            ruleId = "553161494318161920"
+            rulePrimaryKey = "2"
+
+          }
+          if (level.equals("low")) {
+            ruleId = "553161564258181120"
+            rulePrimaryKey = "3"
+          }
+
+          if (level.equals("info") || wb_api_data.equals("0@0@0") || tags.equals("4") || tags.equals("0") || qname.equals("www.notesmaker.com") || qname.equals("www.cmsoft.cn") || qname.equals("a1.zhanzhang.net")) {
+            ""
+          }
+          else {
+            if (tags.equals("empty"))
+            {
+              tags = "[]"
+            }
+            else{
+              tags = tags.replace("\"","")
+            }
+
+            val localTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+
+            "{" + "\"srcip\":" + "\"" + srcip + "\"" + "," +
+              "\"level\":" + "\"" + level + "\"" + "," +
+              "\"data_source\":" + "\"" + "dns" + "\"" + "," +
+              "\"tags\":" + "\"" + tags + "\"" + "," +
+              "\"data_update_time\":" + "\"" + data_update_time + "\"" + "," +
+              "\"ruleId\":" + "\"" + ruleId + "\"" + "," +
+              "\"localTime\":" + "\"" + localTime + "\"" + "," +
+              "\"ipaddr\":" + "\"" + ipaddr + "\"" + "," +
+              "\"rulePrimaryKey\":" + "\"" + rulePrimaryKey + "\"" + "," +
+              "\"dns_data_time\":" + "\"" + dns_data_time + "\"" + "," +
+              "\"qname\":" + "\"" + qname + "\"" + "}"
+          }
+        }
+        override def close(): Unit = {}
+      }
+    ).setParallelism(8).filter(x => x != "")
+
+    def cur_ips(value: String):String = {
+
+      val qname = JSON.parseObject(value).getString("qname")
+      //域名监测 domain/query
+      val res = "," +"\"" + "cur_ips" +"\"" + ":" + FileReportDomain.sendRequest(qname) + "}"
+      val rs = value.replace("}",res)
+      rs
+    }
+
+    val dns = mapResult.map(x=>cur_ips(x))
+
+    val properties1 = new Properties
+    properties1.setProperty("bootstrap.servers", bootstrap_servers_YYM)
+
+    val myProducer = new FlinkKafkaProducer[String](
+      producer_topic, // target topic       FirewallRuleTopic    threat-device
+      new SimpleStringSchema(), // serialization schema
+      properties1
+    ) // fault-tolerance
+    dns.addSink(myProducer)
+    env.execute("Kafka_Flink")
+  }
+}
