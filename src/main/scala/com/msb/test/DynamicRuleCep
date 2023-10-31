@@ -1,0 +1,238 @@
+package dynamicrule
+
+import java.text.SimpleDateFormat
+import java.util.{Date, Properties}
+
+import com.alibaba.fastjson.JSON
+import dynamicrule.JDBCTest.getStringDb
+import org.apache.flink.api.common.functions.{FilterFunction, ReduceFunction}
+import org.apache.flink.streaming.api.scala.DataStream
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.connectors.kafka.{FlinkKafkaConsumer, FlinkKafkaProducer}
+//这个一定要导入，要不然不能隐式转换
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.scala.{StreamExecutionEnvironment, _}
+//import org.apache.flink.streaming.connectors.elasticsearch6.ElasticsearchSink
+import org.apache.flink.api.common.serialization.SimpleStringSchema
+
+
+/*
+FirewallDynamicRule  根据mysql rule表进行规则匹配
+ */
+
+
+object FirewallDynamicRule {
+
+  def main(args: Array[String]): Unit = {
+
+    var ruleId = ""
+    var group_id_firewall_dr = ""
+    if(args.length>0)
+    {
+      for (i <- 0 to args.length-1)
+      {
+        println("i==",i)
+        println("args==",args(i))
+        ruleId = args(0).split("@")(0)
+        group_id_firewall_dr = args(0).split("@")(1)
+      }
+    }
+    println("flink_ruleId=",ruleId)
+    println("flink_group_id_firewall_dr=",group_id_firewall_dr)
+    //读取数据库里的参数配置
+    val rules = getStringDb(ruleId)   //args(i)
+    println(rules)
+    //data_count:100,threatPort:12121,threatProtocol:17,tags:异常登录,interval_time:0,threat_level:high
+    val rules1 = rules.replace(",",":")
+    println(rules1)
+    val arr = rules1.split(":")
+
+    val data_count = arr(1).toInt
+    val threatPort = arr(3).toInt
+    val threatProtocol = arr(5).toInt
+    val tags = arr(7)
+    val interval_time = arr(9).toInt
+    val threat_level = arr(11)
+    val rule_id = arr(13)
+    val data_source = arr(15)
+    val rulePrimaryKey = arr(17)
+
+    val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    env.setParallelism(4)
+    //env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
+    env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime)
+
+    //kafka的配置
+    val properties = new Properties()
+//    properties.setProperty("bootstrap.servers", "10.1.183.11:30305,10.1.183.12:30215,10.1.183.13:32469")
+    properties.setProperty("bootstrap.servers", "10.1.183.77:19092,10.1.183.78:19092,10.1.183.79:19092")
+    //  properties.setProperty("zookeeper.connect", "localhost:2181")
+
+//    var str = scala.util.Random.nextInt(1000).toString
+//    val time1=System.currentTimeMillis().toString
+
+    val ss1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+    val ss2 = ss1.split(" ")(0)
+    println("ss1=",ss1)
+    val ttt = ss1.replace(" ","-").replace(":","_").replace("-","_")
+    println("ttt=",ttt)
+
+    properties.setProperty("group.id", s"consume_id_firewall_${ruleId}_${group_id_firewall_dr}")
+
+//    properties.setProperty("client.id", "admin")
+//    properties.setProperty("scan.startup.mode", "latest-offset") //latest   earliest
+
+    //kafkaSource实例
+    //bigdata-firewall-one-part-topic      firewall2
+    val kafkaSource = new FlinkKafkaConsumer[String]("bigdata-firewall-one-part-topic", new SimpleStringSchema(), properties)
+    //创建DataStream
+    val tesDS: DataStream[String] = env.addSource(kafkaSource)
+    //tesDS.print()
+
+    def strToJson(x: String): String = {
+ //     println("x=", x)
+      //   println(x)
+      var strMessage: String = JSON.parseObject(x).getString("message")
+      //  println(strMessage)
+      strMessage = strMessage.replace(": ", ":")
+      strMessage = strMessage.replace("\"", "")
+      //     strMessage = strMessage.replace("\\","*")
+      //   println(strMessage)
+      val strArray: Array[String] = strMessage.split("\\s+")   //匹配多个空格
+      var buf = ""
+      for (i <- 0 to (strArray.length - 1)) {
+        val keyValueArray = strArray(i).split("=")
+        var tempkV = ""
+        for (j <- 0 to (keyValueArray.length - 1)) {
+          tempkV += "" + keyValueArray(j) + "" + "="
+          if (j == 1)
+            tempkV = tempkV.dropRight(1)
+        }
+        buf += tempkV + ","
+      }
+      buf = buf.dropRight(1)
+      //   buf = "{" + buf + "}"
+      buf = buf.replace("=", ":")
+      buf
+    }
+
+    val tesDS1 = tesDS.map(x => strToJson(x))
+
+    ///////////////////////////////////////////severity///////////////////////////////////////////////////////////////////////
+
+    //    `srcip` STRING,
+    //    `dstip` STRING,
+    //    `attackid` int,
+    //    `severity` STRING,
+    //    `@timestamp` STRING,
+    //    `ts` AS PROCTIME ()
+
+    def strToMapFunSeverity(x: String): String = {
+      val json = new java.util.HashMap[String, String]
+      val elementArray = x.split(",")
+      for (j <- 0 to (elementArray.length - 1)) {
+        if (elementArray(j).split(":").length >= 2) {
+          //json.put(elementArray(j).split(":")(0), elementArray(j).split(":")(1))
+          if ((elementArray(j).split(":")(0) != "") && (elementArray(j).substring(elementArray(j).indexOf(":") + 1, elementArray(j).length) != "")) {
+            json.put(elementArray(j).split(":")(0), elementArray(j).substring(elementArray(j).indexOf(":") + 1, elementArray(j).length))
+          }
+        }
+        else {
+          //json.put(elementArray(j).split(":")(0), "")
+        }
+      }
+      if (json.containsKey("srcip") && json.containsKey("dstip") &&
+        json.containsKey("srcport") && json.containsKey("dstport") && json.containsKey("proto")) {
+
+        "srcip:" + json.get("srcip") + "," +
+          "dstip:" + json.get("dstip") + "," +
+          "srcport:" + json.get("srcport") + "," +
+          "dstport:" + json.get("dstport") + "," +
+          "proto:" + json.get("proto")
+      }
+      else {
+        ""
+      }
+    }
+
+    val severitymap = tesDS1.map(x => strToMapFunSeverity(x)).filter(x => x != "")
+
+    val threatLevel = "高威胁"
+    val dataCount = data_count     //43745
+    val dstportInt = threatPort    //目的端口号
+    val protoInt = threatProtocol      //协议
+
+    //依据 目的端口 dstport，协议 proto来过滤数据
+    val severitymap_filter = severitymap.filter(new FilterFunction[String] {
+      override def filter(value: String): Boolean = {
+        val arr = value.split(",")
+        (arr(3).split(":")(1).toInt == dstportInt) && (arr(4).split(":")(1).toInt == protoInt)
+      }
+    })
+
+
+    //win数据结果 {(srcip#dstport#proto),dstip}
+    val win = severitymap_filter.map(x => (x.split(",")(0) +"#" + x.split(",")(3) +"#" +x.split(",")(4) , x.split(",")(1))).keyBy(0).timeWindow(Time.seconds(interval_time),Time.seconds(1))
+    //依据key (srcip,dstport,proto) 进行目的ip汇总
+    val res = win.reduce(new ReduceFunction[(String, String)] {
+      override def reduce(t: (String, String), t1: (String, String)): (String, String) = {
+        (t._1, t._2 + "@" +t1._2)
+      }
+    })
+
+    //记录disip个数L,将ip@ip@ip格式转换为数组格式  （srcip#dstport#proto#L,[ip,ip,ip]）
+    def funLength(x:(String, String)): (String,String) ={
+      val L = x._2.split("@").length
+      (x._1 + "#" + L.toString , "[" +x._2.replace("@",",") + "]")
+    }
+
+    val result = res.map(x=>funLength(x))
+   // result.print()
+
+    //根据
+    val f = result.filter(x=>x._1.split("#")(3).toInt >= data_count)
+
+    val sendjson = f.map(x=> "{" + "\"srcip\":" + "\"" +x._1.split("#")(0).split(":")(1) + "\"" + "," +
+      "\"dstport\":" + "\"" +threatPort.toString + "\"" + "," +
+      "\"proto\":" + "\"" + threatProtocol.toString + "\"" + "," +
+      "\"ipaddr\":"+ "\"" + x._2.replace("dstip:","") + "\"" + "," +
+      "\"level\":" + "\"" + threat_level + "\"" + ",\"tags\":"+ "\"" + tags + "\"" +
+      ",\"rule_id\":"+ "\"" +rule_id + "\"" +",\"data_source\":" + "\"" + data_source +"\"" +",\"ruleId\":"+"\"" +ruleId+"\"" +
+      ",\"rulePrimaryKey\":"+"\"" +rulePrimaryKey+"\"" +"}")
+
+   //1> {"srcip":"10.66.65.234","dstport":"445","proto":"6","level":"high","tags":"端口扫描","rule_id":"553227605545984000","data_source":"firewall","ruleId":"553227605545984000","rulePrimaryKey":"7"}
+//    sendjson.print()
+
+    val properties1 = new Properties
+
+    properties1.setProperty("bootstrap.servers", "10.1.178.67:9092,10.1.178.68:9092,10.1.178.69:9092")
+//    properties1.setProperty("client.id", "admin")
+
+
+    val myProducer = new FlinkKafkaProducer[String](
+      "threat-device", // target topic       FirewallRuleTopic    threat-device
+      new SimpleStringSchema(), // serialization schema
+      properties1
+    ) // fault-tolerance
+    sendjson.addSink(myProducer)
+
+
+
+//    val stream = sendjson.
+//      map(x=>Firewall_PG_Report_Form_bra(
+//        JSON.parseObject(x).getString("srcip"),JSON.parseObject(x).getString("dstport"),
+//        JSON.parseObject(x).getString("proto"),JSON.parseObject(x).getString("level"),
+//        JSON.parseObject(x).getString("tags"),JSON.parseObject(x).getString("rule_id"),
+//        JSON.parseObject(x).getString("data_source"),JSON.parseObject(x).getString("ruleId"),
+//        JSON.parseObject(x).getString("rulePrimaryKey")
+//      ))
+//
+//    stream.print()
+//    //调用addSink以此来作为数据输出端
+//    stream.addSink(new FirewallPgSQLSink())
+
+
+    env.execute("Kafka_Flink")
+
+  }
+}
