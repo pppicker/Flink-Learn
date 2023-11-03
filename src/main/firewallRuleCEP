@@ -1,9 +1,11 @@
-package dynamicrule
+package com.example
 
-import Utils.PropertiesUtils
+
+//import Utils.PropertiesUtils
 import com.alibaba.fastjson.{JSON, JSONObject}
-import dynamicrule.JDBCTest.getStringDb
-import org.apache.flink.api.common.functions.{FilterFunction, ReduceFunction}
+import com.example.utils.{IPRangeChecker, PropertyUtils}
+import org.apache.flink.cep.pattern.conditions.SimpleCondition
+//import dynamicrule.JDBCTest.getStringDb
 import org.apache.flink.api.common.serialization.SimpleStringSchema
 import org.apache.flink.cep.PatternSelectFunction
 import org.apache.flink.cep.scala.CEP
@@ -13,25 +15,31 @@ import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironm
 import org.apache.flink.streaming.api.windowing.time.Time
 import org.apache.flink.streaming.connectors.kafka.{FlinkKafkaConsumer, FlinkKafkaProducer}
 import org.slf4j.{Logger, LoggerFactory}
+import java.util.Properties
+import java.util
 
-import java.text.SimpleDateFormat
-import java.util.{Date, Properties}
-import scala.collection.JavaConversions.mapAsScalaMap
-import scala.util.parsing.json.JSONObject
 
 // 定义样例类，Event用来存放输入数据，Warning存放输出数据
-case class Event(srcIP: String, dstIP: String, srcPort: String, dstPort: String, proto: String)
-case class Warning(deviceId: String, tempNow: String, warningMsg: String)
+case class Event(srcIP: String, dstIP: String, dstPort: String, proto: String)
+case class Warning(srcIP: List[String], dstIP: List[String], dstPort: String, proto: String, ruleId: String, rulePrimaryKey: String)
+
+//class Warning(var name: String, var age: Int)
+//class Warning(srcIP: List[String], dstIP: List[String], dstPort: String, proto: String, var ruleId: String, var rulePrimaryKey: String)
+
+/**
+ * @author xyh
+ * @date 2023/11/3 20:15
+ **/
 
 
 object FirewallRuleCEP {
 
 
   def main(args: Array[String]): Unit = {
-    //创建日志打印工厂
+
     val logger: Logger = LoggerFactory.getLogger(this.getClass)
 
-    //初始化规则
+    //初始化规则id
     var ruleId = ""
     var groupIdFirewallRule = ""
     if (args.length > 0) {
@@ -46,7 +54,8 @@ object FirewallRuleCEP {
     logger.info("flink_ruleId=", ruleId)
     logger.info("flink_group_id_firewall_dr=", groupIdFirewallRule)
     //读取数据库里的参数配置
-    val rules = getStringDb(ruleId)
+//    val rules = getStringDb(ruleId)
+    val rules = ""
     //data_count:100,threatPort:12121,threatProtocol:17,tags:异常登录,interval_time:0,threat_level:high
     val formatRule = rules.replace(",", ":")
     logger.info("formatRule: " + formatRule)
@@ -55,8 +64,10 @@ object FirewallRuleCEP {
 
     //开始获取传入的规则相关信息
 
+
+
     //日志统计计数
-    val data_count = ruleArray(1).toInt
+    val dataCount = ruleArray(1).toInt
     //威胁端口
     val threatPort = ruleArray(3).toInt
     //协议
@@ -64,15 +75,20 @@ object FirewallRuleCEP {
     //标签
     val tags = ruleArray(7)
     //间隔时间
-    val interval_time = ruleArray(9).toInt
+    val intervalTime = ruleArray(9).toInt
     //威胁等级
-    val threat_level = ruleArray(11)
+    val threatLevel = ruleArray(11)
     //规则id
-    val rule_id = ruleArray(13)
+    val ruleId = ruleArray(13)
     //数据源类型
-    val data_source = ruleArray(15)
+    val dataSource = ruleArray(15)
     //规则主键
     val rulePrimaryKey = ruleArray(17)
+    //sourceIP 支持范围与独立IP
+    val sourceIPRange = ruleArray(19)
+    //dstIP 支持范围与独立IP
+    val dstIPRange = ruleArray(21)
+
 
     val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
     //配置任务并行度
@@ -82,14 +98,8 @@ object FirewallRuleCEP {
 
     //kafka的配置
     val properties = new Properties()
-    properties.setProperty("bootstrap.servers", PropertiesUtils.getProp("kafka.bootstrap.servers"))
-
-    val dateNow = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
-    val timeNow = dateNow.split(" ")(0)
-    //格式化时间
-    val dateFormat = dateNow.replace(" ", "-").replace("-", "_")
-    println("dateNowFormat=", dateFormat)
-
+    properties.setProperty("bootstrap.servers", PropertyUtils.getProp("kafka.bootstrap.servers"))
+    //设置kafka消费者groupId
     properties.setProperty("group.id", s"consume_id_firewall_${ruleId}_${groupIdFirewallRule}")
 
 
@@ -131,7 +141,7 @@ object FirewallRuleCEP {
     //将原始日志流数据解析为kv格式
     val kvStream = sourceStream.map(x => str2kv(x))
 
-    //将数据转换为json对象
+    //将数据转换为Event对象
     def str2Event(x: String): Event = {
 
       val hashMap = new java.util.HashMap[String, String]
@@ -144,88 +154,59 @@ object FirewallRuleCEP {
           }
         }
       }
-      if (hashMap.containsKey("srcip") && hashMap.containsKey("dstip") &&
-        hashMap.containsKey("srcport") && hashMap.containsKey("dstport") && hashMap.containsKey("proto")) {
+      //判断字段值是否缺失
+      if (hashMap.containsKey("srcip") && hashMap.containsKey("dstip") && hashMap.containsKey("dstport") && hashMap.containsKey("proto")) {
 
-        Event(hashMap.get("srcip"),hashMap.get("dstip"),hashMap.get("srcport"),hashMap.get("dstport"),hashMap.get("proto"))
+        Event(hashMap.get("srcip"),hashMap.get("dstip"),hashMap.get("dstport"),hashMap.get("proto"))
       }
       else {
-        Event("","","","","")
+        //字段值缺失统一置为空值
+        Event("","","","")
       }
     }
 
-    //过滤掉字段值不全的数据
+    //过滤掉字段值缺失的数据
     val eventStream = kvStream.map(x => str2Event(x)).filter(x => !x.srcIP.equals(""))
 
-    //防火墙  数据源、协议、端口
-    val pattern = Pattern.begin[Event]("start")
-      .where(_.srcIP equals (threat_level))
-      .times(data_count)
-      .within(Time.seconds(interval_time))
 
+    //创建Pattern匹配规则，根据srcIP,dstIP,dstPort,proto,dataCount条件对数据进行匹配
+    val pattern = Pattern.begin[Event]("start")
+      .where(event => IPRangeChecker.isIPInRange(event.srcIP,sourceIPRange) && IPRangeChecker.isIPInRange(event.dstIP,dstIPRange) && event.dstPort == threatPort && event.proto.equals(threatProtocol))
+      .times(dataCount)
+      .within(Time.seconds(intervalTime))
+
+    //对数据流应用匹配规则
     val patternStream = CEP.pattern(eventStream, pattern)
 
     // 使用select方法来捕捉结果，EventMatch为捕捉结果的函数
-    val resultStream = patternStream.select(new EventMatch)
+    val resultStream = patternStream.select(new EventMatch(threatPort, threatProtocol, ruleId ,rulePrimaryKey))
 
-    //firewall 依据数据源、协议、目的端口 三个参数来确定
-    val sss = severityMap.filter(new FilterFunction[String] {
-      override def filter(value: String): Boolean = {
-        val arr = value.split(",")
-        (arr(3).split(":")(1).toInt == threatPort) && (arr(4).split(":")(1).toInt == threatProtocol)
-      }
-    })
+    val kafkaProperties = new Properties
 
-
-
-
-    def funLength(x: (String, String)): (String, String) = {
-
-      val L = x._2.split("@").length
-      (x._1 + "#" + L.toString, "[" + x._2.replace("@", ",") + "]")
-    }
-
-    val result = res.map(x => funLength(x))
-    // result.print()
-
-    val f = result.filter(x => x._1.split("#")(3).toInt >= data_count).filter(x => x._2.split(",").toSet.size >= 2)
-
-    val sendjson = f.map(x => "{" + "\"srcip\":" + "\"" + x._1.split("#")(0).split(":")(1) + "\"" + "," +
-      "\"dstport\":" + "\"" + threatPort.toString + "\"" + "," +
-      "\"proto\":" + "\"" + threatProtocol.toString + "\"" + "," +
-      "\"ipaddr\":" + "\"" + x._2.replace("dstip:", "") + "\"" + "," +
-      "\"level\":" + "\"" + threat_level + "\"" + ",\"tags\":" + "\"" + tags + "\"" +
-      ",\"rule_id\":" + "\"" + rule_id + "\"" + ",\"data_source\":" + "\"" + data_source + "\"" + ",\"ruleId\":" + "\"" + ruleId + "\"" +
-      ",\"rulePrimaryKey\":" + "\"" + rulePrimaryKey + "\"" + "}")
-
-    //1> {"srcip":"10.66.65.234","dstport":"445","proto":"6","level":"high","tags":"端口扫描","rule_id":"553227605545984000","data_source":"firewall","ruleId":"553227605545984000","rulePrimaryKey":"7"}
-
-    val properties1 = new Properties
-
-    properties1.setProperty("bootstrap.servers", "10.1.178.67:9092,10.1.178.68:9092,10.1.178.69:9092")
+    kafkaProperties.setProperty("bootstrap.servers", "10.1.178.67:9092,10.1.178.68:9092,10.1.178.69:9092")
 
     val myProducer = new FlinkKafkaProducer[String](
       "threat-device",
       new SimpleStringSchema(),
-      properties1
+      kafkaProperties
     )
-    sendjson.addSink(myProducer)
+    resultStream.addSink(myProducer)
 
-    env.execute("Kafka_Flink")
+    env.execute("firewall-rule-cep")
 
   }
-
-
 }
 
-import java.util
-//import scala.Option.option2Iterable
-//import scala.collection.mutable
+//重写PatternSelectFunction方法，用Warning样例类来接收数据
+class EventMatch(dstPort: String, proto: String, ruleId: String ,rulePrimaryKey: String ) extends PatternSelectFunction[Event, Warning] {
+  override def select(map: util.Map[String, util.List[Event]]): Warning = {
+    val srcIPList: List[String] = List()
+    val dstIPList: List[String] = List()
+    //遍历获取所有匹配到的event，将信息加入到List中
+    map.get("start").forEach(event => srcIPList :+ event.srcIP)
+    map.get("start").forEach(event => dstIPList :+ event.srcIP)
 
-// 重写PatternSelectFunction方法，用Warning样例类来接收数据
-class EventMatch() extends PatternSelectFunction[Event, Warning] {
-  override def select(pattern: util.Map[String, util.List[Event]]): Warning = {
-    val status = pattern.get("start").get(0)
-    Warning(status.deviceId, status.tempNow, "Temperature High Warning")
+    //proto，ruleId，rulePrimaryKey字段由方法外面传入赋值
+    Warning(srcIPList, dstIPList, dstPort, proto, ruleId, rulePrimaryKey)
   }
 }
