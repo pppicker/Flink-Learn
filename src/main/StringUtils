@@ -1,0 +1,42 @@
+package Utils
+
+import org.apache.commons.lang3.StringUtils
+
+object DateUtil {
+
+  def main(args: Array[String]): Unit = {
+
+    val ip = "1.12.123.1"
+
+    println(IPFormat(ip))
+
+  }
+
+
+  def IPScopeJudgment(ipScope: String,ip: String) = {
+    val startIP = ipScope.split(",")(0)
+    val endIP = ipScope.split(",")(1)
+    //1.1.1.1
+  }
+
+  def IPFormat(ip: String): String = {
+    //1.1.1.1
+    val ipArray = ip.split("\\.")
+
+    var result = ""
+    for(ip<-ipArray){
+      println("print" + ip + " : " + ip.length)
+      if(ip.length<3){
+        result = result + StringUtils.leftPad(ip, 3, "0")
+      } else {
+        result = result + ip
+      }
+    }
+    result
+  }
+
+
+
+
+
+}
