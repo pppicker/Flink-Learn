@@ -1,0 +1,231 @@
+package dynamicrule
+
+import Utils.PropertiesUtils
+import com.alibaba.fastjson.{JSON, JSONObject}
+import dynamicrule.JDBCTest.getStringDb
+import org.apache.flink.api.common.functions.{FilterFunction, ReduceFunction}
+import org.apache.flink.api.common.serialization.SimpleStringSchema
+import org.apache.flink.cep.PatternSelectFunction
+import org.apache.flink.cep.scala.CEP
+import org.apache.flink.cep.scala.pattern.Pattern
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment, createTypeInformation}
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.connectors.kafka.{FlinkKafkaConsumer, FlinkKafkaProducer}
+import org.slf4j.{Logger, LoggerFactory}
+
+import java.text.SimpleDateFormat
+import java.util.{Date, Properties}
+import scala.collection.JavaConversions.mapAsScalaMap
+import scala.util.parsing.json.JSONObject
+
+// 定义样例类，Event用来存放输入数据，Warning存放输出数据
+case class Event(srcIP: String, dstIP: String, srcPort: String, dstPort: String, proto: String)
+case class Warning(deviceId: String, tempNow: String, warningMsg: String)
+
+
+object FirewallRuleCEP {
+
+
+  def main(args: Array[String]): Unit = {
+    //创建日志打印工厂
+    val logger: Logger = LoggerFactory.getLogger(this.getClass)
+
+    //初始化规则
+    var ruleId = ""
+    var groupIdFirewallRule = ""
+    if (args.length > 0) {
+      for (i <- 0 to args.length - 1) {
+        logger.info("i==", i)
+        logger.info("args==", args(i))
+        ruleId = args(0).split("@")(0)
+        //groupid根据@将传入数据分割得到
+        groupIdFirewallRule = args(0).split("@")(1)
+      }
+    }
+    logger.info("flink_ruleId=", ruleId)
+    logger.info("flink_group_id_firewall_dr=", groupIdFirewallRule)
+    //读取数据库里的参数配置
+    val rules = getStringDb(ruleId)
+    //data_count:100,threatPort:12121,threatProtocol:17,tags:异常登录,interval_time:0,threat_level:high
+    val formatRule = rules.replace(",", ":")
+    logger.info("formatRule: " + formatRule)
+    //将规则数据分割为数组，方便后面获取使用
+    val ruleArray = formatRule.split(":")
+
+    //开始获取传入的规则相关信息
+
+    //日志统计计数
+    val data_count = ruleArray(1).toInt
+    //威胁端口
+    val threatPort = ruleArray(3).toInt
+    //协议
+    val threatProtocol = ruleArray(5).toInt
+    //标签
+    val tags = ruleArray(7)
+    //间隔时间
+    val interval_time = ruleArray(9).toInt
+    //威胁等级
+    val threat_level = ruleArray(11)
+    //规则id
+    val rule_id = ruleArray(13)
+    //数据源类型
+    val data_source = ruleArray(15)
+    //规则主键
+    val rulePrimaryKey = ruleArray(17)
+
+    val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    //配置任务并行度
+    env.setParallelism(4)
+    //使用处理时间语义
+    env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime)
+
+    //kafka的配置
+    val properties = new Properties()
+    properties.setProperty("bootstrap.servers", PropertiesUtils.getProp("kafka.bootstrap.servers"))
+
+    val dateNow = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
+    val timeNow = dateNow.split(" ")(0)
+    //格式化时间
+    val dateFormat = dateNow.replace(" ", "-").replace("-", "_")
+    println("dateNowFormat=", dateFormat)
+
+    properties.setProperty("group.id", s"consume_id_firewall_${ruleId}_${groupIdFirewallRule}")
+
+
+    val kafkaSource = new FlinkKafkaConsumer[String]("bigdata-firewall-one-part-topic", new SimpleStringSchema(), properties)
+    //创建DataStream
+    val sourceStream: DataStream[String] = env.addSource(kafkaSource)
+
+    //将kafka数据中message原始字符串解析为k=v格式
+    def str2kv(x: String): String = {
+      //按Json格式解析日志，获取message字段信息
+      var strMessage: String = JSON.parseObject(x).getString("message")
+
+      strMessage = strMessage.replace(": ", ":")
+      //删除message信息中的双引号
+      strMessage = strMessage.replace("\"", "")
+
+      //匹配多个空格进行分割
+      val strArray: Array[String] = strMessage.split("\\s+")
+
+      //初始化结果
+      var buf = ""
+
+      //遍历array,解析为key=value，key2=value2格式
+      for (i <- 0 to (strArray.length - 1)) {
+        val keyValueArray = strArray(i).split("=")
+        var tempkV = ""
+        for (j <- 0 to (keyValueArray.length - 1)) {
+          tempkV += "" + keyValueArray(j) + "" + "="
+          if (j == 1)
+            tempkV = tempkV.dropRight(1)
+        }
+        buf += tempkV + ","
+      }
+      buf = buf.dropRight(1)
+      buf = buf.replace("=", ":")
+      buf
+    }
+
+    //将原始日志流数据解析为kv格式
+    val kvStream = sourceStream.map(x => str2kv(x))
+
+    //将数据转换为json对象
+    def str2Event(x: String): Event = {
+
+      val hashMap = new java.util.HashMap[String, String]
+      val elementArray = x.split(",")
+      for (j <- 0 to (elementArray.length - 1)) {
+        if (elementArray(j).split(":").length >= 2) {
+          //json.put(elementArray(j).split(":")(0), elementArray(j).split(":")(1))
+          if ((elementArray(j).split(":")(0) != "") && (elementArray(j).substring(elementArray(j).indexOf(":") + 1, elementArray(j).length) != "")) {
+            hashMap.put(elementArray(j).split(":")(0), elementArray(j).substring(elementArray(j).indexOf(":") + 1, elementArray(j).length))
+          }
+        }
+      }
+      if (hashMap.containsKey("srcip") && hashMap.containsKey("dstip") &&
+        hashMap.containsKey("srcport") && hashMap.containsKey("dstport") && hashMap.containsKey("proto")) {
+
+        Event(hashMap.get("srcip"),hashMap.get("dstip"),hashMap.get("srcport"),hashMap.get("dstport"),hashMap.get("proto"))
+      }
+      else {
+        Event("","","","","")
+      }
+    }
+
+    //过滤掉字段值不全的数据
+    val eventStream = kvStream.map(x => str2Event(x)).filter(x => !x.srcIP.equals(""))
+
+    //防火墙  数据源、协议、端口
+    val pattern = Pattern.begin[Event]("start")
+      .where(_.srcIP equals (threat_level))
+      .times(data_count)
+      .within(Time.seconds(interval_time))
+
+    val patternStream = CEP.pattern(eventStream, pattern)
+
+    // 使用select方法来捕捉结果，EventMatch为捕捉结果的函数
+    val resultStream = patternStream.select(new EventMatch)
+
+    //firewall 依据数据源、协议、目的端口 三个参数来确定
+    val sss = severityMap.filter(new FilterFunction[String] {
+      override def filter(value: String): Boolean = {
+        val arr = value.split(",")
+        (arr(3).split(":")(1).toInt == threatPort) && (arr(4).split(":")(1).toInt == threatProtocol)
+      }
+    })
+
+
+
+
+    def funLength(x: (String, String)): (String, String) = {
+
+      val L = x._2.split("@").length
+      (x._1 + "#" + L.toString, "[" + x._2.replace("@", ",") + "]")
+    }
+
+    val result = res.map(x => funLength(x))
+    // result.print()
+
+    val f = result.filter(x => x._1.split("#")(3).toInt >= data_count).filter(x => x._2.split(",").toSet.size >= 2)
+
+    val sendjson = f.map(x => "{" + "\"srcip\":" + "\"" + x._1.split("#")(0).split(":")(1) + "\"" + "," +
+      "\"dstport\":" + "\"" + threatPort.toString + "\"" + "," +
+      "\"proto\":" + "\"" + threatProtocol.toString + "\"" + "," +
+      "\"ipaddr\":" + "\"" + x._2.replace("dstip:", "") + "\"" + "," +
+      "\"level\":" + "\"" + threat_level + "\"" + ",\"tags\":" + "\"" + tags + "\"" +
+      ",\"rule_id\":" + "\"" + rule_id + "\"" + ",\"data_source\":" + "\"" + data_source + "\"" + ",\"ruleId\":" + "\"" + ruleId + "\"" +
+      ",\"rulePrimaryKey\":" + "\"" + rulePrimaryKey + "\"" + "}")
+
+    //1> {"srcip":"10.66.65.234","dstport":"445","proto":"6","level":"high","tags":"端口扫描","rule_id":"553227605545984000","data_source":"firewall","ruleId":"553227605545984000","rulePrimaryKey":"7"}
+
+    val properties1 = new Properties
+
+    properties1.setProperty("bootstrap.servers", "10.1.178.67:9092,10.1.178.68:9092,10.1.178.69:9092")
+
+    val myProducer = new FlinkKafkaProducer[String](
+      "threat-device",
+      new SimpleStringSchema(),
+      properties1
+    )
+    sendjson.addSink(myProducer)
+
+    env.execute("Kafka_Flink")
+
+  }
+
+
+}
+
+import java.util
+//import scala.Option.option2Iterable
+//import scala.collection.mutable
+
+// 重写PatternSelectFunction方法，用Warning样例类来接收数据
+class EventMatch() extends PatternSelectFunction[Event, Warning] {
+  override def select(pattern: util.Map[String, util.List[Event]]): Warning = {
+    val status = pattern.get("start").get(0)
+    Warning(status.deviceId, status.tempNow, "Temperature High Warning")
+  }
+}
